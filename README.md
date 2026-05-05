@@ -1,28 +1,30 @@
 # CleanAPI
 
-CleanAPI is a high-performance Go library and CLI utility designed to simplify and prune OpenAPI 3.0 specifications. It allows you to transform bloated, auto-generated, or internal specs into clean, consumer-ready documentation.
+CleanAPI is a Go library and CLI utility designed to surgically prune and optimize OpenAPI 3.0 specifications. It allows you to transform bloated, auto-generated, or internal specs into lean, purpose-built definitions optimized for machine consumers like client SDK generators, mock servers, and internal tooling.
 
 ## Why
 
-OpenAPI specifications—especially those generated from code—often contain a significant amount of "noise" that can overwhelm consumers, inflate file sizes, and leak internal details. Sometimes the spec file is simply too bloated and complex for the specific purpose you want to use it for (e.g., generating client SDKs, documentation, or mock servers). Common issues include:
--   **Leaked Extensions**: Internal `x-` metadata used by specific tools (like code generators or gateways) that aren't relevant to external users.
--   **Recursive Bloat**: Huge schemas with deep recursion or unnecessary examples.
--   **Unused Components**: Orphaned schemas, responses, or parameters that remain in the `components` section after paths are removed.
--   **Non-Production Responses**: Error responses (4xx, 5xx) or internal endpoints that you may wish to hide from a public-facing spec.
+OpenAPI specifications—especially those generated from code—often contain significant technical debt and "noise" that can break generators, inflate file sizes, and leak internal implementation details. A spec intended for a public SDK should not contain internal extensions, unused schemas, or non-production error responses.
 
-CleanAPI provides a surgical way to strip this noise while maintaining a valid, functional specification.
+Common issues that CleanAPI solves:
+-   **Generator Noise**: Internal `x-` metadata used by specific tools (like gateways) that can confuse or bloat client SDK generators.
+-   **Schema Bloat**: Huge schemas with deep recursion or unnecessary examples that increase bundle size in generated clients.
+-   **Unused Components**: Orphaned schemas, responses, or parameters that remain in the `components` section, leading to "dead code" in generated models.
+-   **Internal Leakage**: Non-production responses (4xx, 5xx) or internal endpoints that shouldn't be exposed to specific consumers.
+
+CleanAPI provides a surgical way to strip this noise, ensuring your spec is as lean as possible for its specific target use case.
 
 ## What It Does
 
-CleanAPI performs a multi-stage cleaning and pruning process:
+CleanAPI performs a multi-stage technical pruning process:
 
-1.  **Metadata Stripping: Removes licenses, contact info, and external documentation if requested.
-2.  **Surgical Filtering**: Keep only the operations you want. It automatically prunes empty paths.
-3.  **Content Cleaning**: Strips examples, strips non-2xx responses, and can even remove response schemas entirely (leaving only the status code).
-4.  **Extension Management**: Optionally strips all `x-` extensions document-wide.
-5.  **Smart GC (Garbage Collection)**: A recursive "mark-and-sweep" pruning engine identifies and removes all components (schemas, headers, responses, etc.) that are no longer reachable from the remaining operations.
-6.  **Recursive Safety**: Safely handles circular references in schemas and component dependencies without stack overflows.
-7.  **External Reference Resolution**: Correctly follows and resolves `$ref` pointers to external files.
+1.  **Surgical Filtering**: Keep only the operations you actually need for a specific consumer.
+2.  **Smart Garbage Collection**: A recursive "mark-and-sweep" engine identifies and removes all top-level components (schemas, headers, responses) that are no longer reachable from the remaining operations.
+3.  **Content Stripping**: Removes examples, non-2xx responses, or even entire response schemas to minimize the footprint of generated code.
+4.  **Extension Management**: Optionally strips all `x-` extensions document-wide to avoid generator-specific conflicts.
+5.  **Recursive Safety**: Safely handles circular references and complex component dependencies.
+6.  **Metadata Pruning**: Removes licenses, contact info, and external documentation to keep the spec focused on the interface definition.
+7.  **External Reference Resolution**: Correctly follows and resolves `$ref` pointers to external files during the pruning process.
 
 ## CLI
 
