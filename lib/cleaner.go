@@ -30,6 +30,25 @@ type CleanOptions struct {
 	StripMetadata bool
 }
 
+// CleanAndPruneOpenAPI is the main entry point for the cleaning process.
+// It modifies the provided openapi3.T document in-place based on the CleanOptions.
+func CleanAndPruneOpenAPI(doc *openapi3.T, opts CleanOptions) {
+	if doc == nil {
+		return
+	}
+
+	c := newCleaner(doc, opts)
+
+	c.cleanMetadata()
+	c.cleanServers(c.doc.Servers)
+	c.cleanPaths()
+	c.cleanTags()
+
+	// pruneComponents implements a mark-and-sweep style garbage collector to remove
+	// top-level components that are no longer reachable from any operation.
+	c.pruneComponents()
+}
+
 // cleaner holds the internal state for a single cleaning run.
 // State encapsulation prevents side effects and allows for easier tracking of visited nodes
 // in recursive operations, which is critical for handling circular references.
@@ -47,54 +66,11 @@ type cleaner struct {
 	visitedObjects map[interface{}]bool
 }
 
-// CleanAndPruneOpenAPI is the main entry point for the cleaning process.
-// It modifies the provided openapi3.T document in-place based on the CleanOptions.
-func CleanAndPruneOpenAPI(doc *openapi3.T, opts CleanOptions) {
-	keepOps := make(map[*openapi3.Operation]bool)
-	isFiltering := len(opts.KeepOperationIDs) > 0 || len(opts.KeepTags) > 0
+// newCleaner initializes a cleaner with the given document and options.
+func newCleaner(doc *openapi3.T, opts CleanOptions) *cleaner {
+	keepOps, isFiltering := buildKeepOpsMap(doc, opts)
 
-	if isFiltering {
-		ids := make(map[string]bool)
-		for _, id := range opts.KeepOperationIDs {
-			ids[id] = true
-		}
-		tags := make(map[string]bool)
-		for _, t := range opts.KeepTags {
-			tags[t] = true
-		}
-
-		if doc.Paths != nil {
-			for _, pathItem := range doc.Paths.Map() {
-				for _, op := range pathItem.Operations() {
-					// We use intersection logic if both are provided: match tag AND match ID.
-					// If only one is provided, it just needs to match that one.
-
-					matchTag := len(tags) == 0
-					if !matchTag {
-						for _, t := range op.Tags {
-							if tags[t] {
-								matchTag = true
-								break
-							}
-						}
-					}
-
-					matchID := len(ids) == 0
-					if !matchID {
-						if op.OperationID != "" && ids[op.OperationID] {
-							matchID = true
-						}
-					}
-
-					if matchTag && matchID {
-						keepOps[op] = true
-					}
-				}
-			}
-		}
-	}
-
-	c := &cleaner{
+	return &cleaner{
 		doc:            doc,
 		opts:           opts,
 		keepOps:        keepOps,
@@ -102,13 +78,55 @@ func CleanAndPruneOpenAPI(doc *openapi3.T, opts CleanOptions) {
 		visitedSchemas: make(map[*openapi3.Schema]bool),
 		visitedObjects: make(map[interface{}]bool),
 	}
+}
 
-	c.cleanMetadata()
-	c.cleanPaths()
-	c.cleanTags()
-	// pruneComponents implements a mark-and-sweep style garbage collector to remove
-	// top-level components that are no longer reachable from any operation.
-	c.pruneComponents()
+// buildKeepOpsMap identifies which operations should be preserved based on IDs and Tags.
+func buildKeepOpsMap(doc *openapi3.T, opts CleanOptions) (map[*openapi3.Operation]bool, bool) {
+	keepOps := make(map[*openapi3.Operation]bool)
+	isFiltering := len(opts.KeepOperationIDs) > 0 || len(opts.KeepTags) > 0
+
+	if !isFiltering || doc.Paths == nil {
+		return keepOps, isFiltering
+	}
+
+	ids := make(map[string]bool)
+	for _, id := range opts.KeepOperationIDs {
+		ids[id] = true
+	}
+	tags := make(map[string]bool)
+	for _, t := range opts.KeepTags {
+		tags[t] = true
+	}
+
+	for _, pathItem := range doc.Paths.Map() {
+		for _, op := range pathItem.Operations() {
+			// Selection logic: match tag AND match ID if both are provided.
+			// If only one criteria is provided, match that one.
+
+			matchTag := len(tags) == 0
+			if !matchTag {
+				for _, t := range op.Tags {
+					if tags[t] {
+						matchTag = true
+						break
+					}
+				}
+			}
+
+			matchID := len(ids) == 0
+			if !matchID {
+				if op.OperationID != "" && ids[op.OperationID] {
+					matchID = true
+				}
+			}
+
+			if matchTag && matchID {
+				keepOps[op] = true
+			}
+		}
+	}
+
+	return keepOps, isFiltering
 }
 
 // cleanMetadata removes top-level document metadata like contact, license, and extensions.
@@ -133,6 +151,23 @@ func (c *cleaner) cleanMetadata() {
 	}
 }
 
+// cleanServers removes extensions from a list of Server objects.
+func (c *cleaner) cleanServers(servers openapi3.Servers) {
+	if !c.opts.RemoveExtensions {
+		return
+	}
+	for _, s := range servers {
+		if s != nil {
+			s.Extensions = nil
+			for _, v := range s.Variables {
+				if v != nil {
+					v.Extensions = nil
+				}
+			}
+		}
+	}
+}
+
 // cleanPaths iterates through all API paths and operations, applying filters and cleaning logic.
 func (c *cleaner) cleanPaths() {
 	if c.doc.Paths == nil {
@@ -149,6 +184,8 @@ func (c *cleaner) cleanPaths() {
 		if c.opts.RemoveExtensions {
 			pathItem.Extensions = nil
 		}
+
+		c.cleanServers(pathItem.Servers)
 
 		// Filter operations by operationId or tags. This is done before cleaning individual operations
 		// to avoid unnecessary work on operations that will be discarded.
@@ -171,7 +208,7 @@ func (c *cleaner) cleanPaths() {
 	}
 }
 
-// cleanOperation handles the cleaning of a single API operation, including its responses and bodies.
+// cleanOperation handles the cleaning of a single API operation.
 func (c *cleaner) cleanOperation(op *openapi3.Operation) {
 	if c.opts.StripMetadata {
 		op.ExternalDocs = nil
@@ -179,7 +216,14 @@ func (c *cleaner) cleanOperation(op *openapi3.Operation) {
 	if c.opts.RemoveExtensions {
 		op.Extensions = nil
 	}
-	op.Deprecated = false
+	if op.Servers != nil {
+		c.cleanServers(*op.Servers)
+	}
+
+	// Deprecated status is considered metadata that can be stripped if requested.
+	if c.opts.StripMetadata {
+		op.Deprecated = false
+	}
 
 	// Filter responses by status code. Only 2xx responses are kept if RemoveNon2xxErrors is set.
 	if c.opts.RemoveNon2xxErrors {
@@ -199,20 +243,36 @@ func (c *cleaner) cleanOperation(op *openapi3.Operation) {
 	}
 
 	if op.RequestBody != nil && op.RequestBody.Value != nil {
-		if c.opts.RemoveExtensions {
-			op.RequestBody.Value.Extensions = nil
-		}
-		c.cleanContent(op.RequestBody.Value.Content)
+		c.cleanRequestBody(op.RequestBody.Value)
 	}
 
 	for _, p := range op.Parameters {
 		if p.Value != nil {
-			if c.opts.RemoveExtensions {
-				p.Value.Extensions = nil
-			}
-			c.cleanExampleAndSchema(&p.Value.Example, p.Value.Examples, p.Value.Schema)
+			c.cleanParameter(p.Value)
 		}
 	}
+}
+
+// cleanRequestBody cleans a RequestBody object.
+func (c *cleaner) cleanRequestBody(rb *openapi3.RequestBody) {
+	if rb == nil {
+		return
+	}
+	if c.opts.RemoveExtensions {
+		rb.Extensions = nil
+	}
+	c.cleanContent(rb.Content)
+}
+
+// cleanParameter cleans a Parameter object.
+func (c *cleaner) cleanParameter(p *openapi3.Parameter) {
+	if p == nil {
+		return
+	}
+	if c.opts.RemoveExtensions {
+		p.Extensions = nil
+	}
+	c.cleanExampleAndSchema(&p.Example, p.Examples, p.Schema)
 }
 
 // cleanResponse cleans a single response object.
@@ -225,13 +285,12 @@ func (c *cleaner) cleanResponse(respRef *openapi3.ResponseRef) {
 	if c.opts.RemoveExtensions {
 		res.Extensions = nil
 	}
-
-	for _, header := range res.Headers {
-		if header.Value != nil {
+	for _, h := range res.Headers {
+		if h != nil && h.Value != nil {
 			if c.opts.RemoveExtensions {
-				header.Value.Extensions = nil
+				h.Value.Extensions = nil
 			}
-			c.cleanExampleAndSchema(&header.Value.Example, header.Value.Examples, header.Value.Schema)
+			c.cleanExampleAndSchema(&h.Value.Example, h.Value.Examples, h.Value.Schema)
 		}
 	}
 
@@ -252,7 +311,7 @@ func (c *cleaner) cleanContent(content openapi3.Content) {
 	}
 }
 
-// cleanExampleAndSchema is a helper to unify the cleaning of common fields in Parameters, Headers, and Content.
+// cleanExampleAndSchema is a helper to unify the cleaning of common fields.
 func (c *cleaner) cleanExampleAndSchema(example *interface{}, examples openapi3.Examples, schema *openapi3.SchemaRef) {
 	if c.opts.CleanExamples {
 		if example != nil {
@@ -268,7 +327,6 @@ func (c *cleaner) cleanExampleAndSchema(example *interface{}, examples openapi3.
 }
 
 // cleanSchema recursively cleans a schema object.
-// It uses visitedSchemas to prevent infinite loops in recursive data structures.
 func (c *cleaner) cleanSchema(s *openapi3.Schema) {
 	if s == nil || c.visitedSchemas[s] {
 		return
@@ -283,10 +341,10 @@ func (c *cleaner) cleanSchema(s *openapi3.Schema) {
 	}
 	if c.opts.StripMetadata {
 		s.ExternalDocs = nil
+		s.Deprecated = false
 	}
-	s.Deprecated = false
 
-	// Recursive traversal of sub-schemas in properties and composition keywords (allOf, anyOf, etc.)
+	// Recursive traversal of sub-schemas.
 	for _, prop := range s.Properties {
 		c.cleanSchema(prop.Value)
 	}
@@ -323,7 +381,7 @@ func (c *cleaner) cleanTags() {
 			}
 		}
 	} else {
-		// If we are not filtering operations, all tags are considered "used" for the purpose of cleaning them.
+		// If we are not filtering operations, all tags are considered "used".
 		for _, tag := range c.doc.Tags {
 			usedTags[tag.Name] = true
 		}
@@ -344,9 +402,7 @@ func (c *cleaner) cleanTags() {
 	c.doc.Tags = filtered
 }
 
-// pruneComponents removes unreferenced top-level components from the document.
-// Since components can reference each other, this process is run in a loop until no more
-// components can be pruned (fixed-point iteration).
+// pruneComponents removes unreferenced top-level components using mark-and-sweep.
 func (c *cleaner) pruneComponents() {
 	if c.doc.Components == nil {
 		return
@@ -359,77 +415,95 @@ func (c *cleaner) pruneComponents() {
 		c.doc.Components.Examples = nil
 	}
 
+	// If we are stripping all response schemas, we can clear them in the components section too.
 	if c.opts.RemoveResponseSchemas {
 		for _, respRef := range c.doc.Components.Responses {
-			respRef.Ref = ""
-			if respRef.Value != nil {
+			if respRef != nil && respRef.Value != nil {
 				respRef.Value.Content = nil
 			}
 		}
 	}
 
-	for {
-		usedRefs := make(map[string]bool)
-		c.visitedObjects = make(map[interface{}]bool) // Reset visited objects for each trace
-		c.traceAllRefs(usedRefs)
+	usedRefs := make(map[string]bool)
+	c.visitedObjects = make(map[interface{}]bool)
+	c.traceAllRefs(usedRefs)
 
-		initialLen := c.getComponentCount()
+	// Prune unused components and clean the ones we keep.
+	c.pruneAndCleanSchemas(usedRefs)
+	c.pruneAndCleanCategory(c.doc.Components.RequestBodies, "#/components/requestBodies/", usedRefs, func(v interface{}) {
+		c.cleanRequestBody(v.(*openapi3.RequestBody))
+	})
+	c.pruneAndCleanCategory(c.doc.Components.Responses, "#/components/responses/", usedRefs, func(v interface{}) {
+		c.cleanResponse(&openapi3.ResponseRef{Value: v.(*openapi3.Response)})
+	})
+	c.pruneAndCleanCategory(c.doc.Components.Parameters, "#/components/parameters/", usedRefs, func(v interface{}) {
+		c.cleanParameter(v.(*openapi3.Parameter))
+	})
+	c.pruneAndCleanCategory(c.doc.Components.Headers, "#/components/headers/", usedRefs, func(v interface{}) {
+		h := v.(*openapi3.Header)
+		if c.opts.RemoveExtensions {
+			h.Extensions = nil
+		}
+		c.cleanExampleAndSchema(&h.Example, h.Examples, h.Schema)
+	})
+	c.pruneAndCleanCategory(c.doc.Components.Examples, "#/components/examples/", usedRefs, nil)
+	c.pruneAndCleanCategory(c.doc.Components.SecuritySchemes, "#/components/securitySchemes/", usedRefs, func(v interface{}) {
+		ss := v.(*openapi3.SecurityScheme)
+		if c.opts.RemoveExtensions {
+			ss.Extensions = nil
+		}
+	})
+	c.pruneAndCleanCategory(c.doc.Components.Links, "#/components/links/", usedRefs, func(v interface{}) {
+		l := v.(*openapi3.Link)
+		if c.opts.RemoveExtensions {
+			l.Extensions = nil
+		}
+	})
+	c.pruneAndCleanCategory(c.doc.Components.Callbacks, "#/components/callbacks/", usedRefs, nil)
+}
 
-		// Prune Unused components from each category.
-		for name := range c.doc.Components.Schemas {
-			if !usedRefs["#/components/schemas/"+name] {
-				delete(c.doc.Components.Schemas, name)
-			} else {
-				// We still need to clean the schemas that are kept.
-				c.cleanSchema(c.doc.Components.Schemas[name].Value)
-			}
-		}
-		for name := range c.doc.Components.RequestBodies {
-			if !usedRefs["#/components/requestBodies/"+name] {
-				delete(c.doc.Components.RequestBodies, name)
-			}
-		}
-		for name := range c.doc.Components.Responses {
-			if !usedRefs["#/components/responses/"+name] {
-				delete(c.doc.Components.Responses, name)
-			}
-		}
-		for name := range c.doc.Components.Parameters {
-			if !usedRefs["#/components/parameters/"+name] {
-				delete(c.doc.Components.Parameters, name)
-			}
-		}
-		for name := range c.doc.Components.Headers {
-			if !usedRefs["#/components/headers/"+name] {
-				delete(c.doc.Components.Headers, name)
-			}
-		}
-		for name := range c.doc.Components.Examples {
-			if !usedRefs["#/components/examples/"+name] {
-				delete(c.doc.Components.Examples, name)
-			}
-		}
-		for name := range c.doc.Components.SecuritySchemes {
-			if !usedRefs["#/components/securitySchemes/"+name] {
-				delete(c.doc.Components.SecuritySchemes, name)
-			}
-		}
-		for name := range c.doc.Components.Links {
-			if !usedRefs["#/components/links/"+name] {
-				delete(c.doc.Components.Links, name)
-			}
-		}
-		for name := range c.doc.Components.Callbacks {
-			if !usedRefs["#/components/callbacks/"+name] {
-				delete(c.doc.Components.Callbacks, name)
-			}
-		}
-
-		// If no components were removed in this pass, we've reached a stable state.
-		if c.getComponentCount() == initialLen {
-			break
+// pruneAndCleanSchemas handles the Schemas category specifically due to recursive cleaning.
+func (c *cleaner) pruneAndCleanSchemas(used map[string]bool) {
+	for name, ref := range c.doc.Components.Schemas {
+		if !used["#/components/schemas/"+name] {
+			delete(c.doc.Components.Schemas, name)
+		} else if ref != nil {
+			c.cleanSchema(ref.Value)
 		}
 	}
+}
+
+// pruneAndCleanCategory handles generic component categories.
+func (c *cleaner) pruneAndCleanCategory(m interface{}, prefix string, used map[string]bool, cleanFn func(interface{})) {
+	v := reflect.ValueOf(m)
+	if v.Kind() != reflect.Map {
+		return
+	}
+	for _, key := range v.MapKeys() {
+		name := key.String()
+		if !used[prefix+name] {
+			v.SetMapIndex(key, reflect.Value{})
+		} else if cleanFn != nil {
+			elem := v.MapIndex(key)
+			if !elem.IsNil() {
+				valField := elem.Elem().FieldByName("Value")
+				if valField.IsValid() && !valField.IsNil() {
+					cleanFn(valField.Interface())
+				}
+			}
+		}
+	}
+}
+
+// getComponentCount returns the total number of top-level components.
+func (c *cleaner) getComponentCount() int {
+	comps := c.doc.Components
+	if comps == nil {
+		return 0
+	}
+	return len(comps.Schemas) + len(comps.RequestBodies) + len(comps.Responses) +
+		len(comps.Parameters) + len(comps.Headers) + len(comps.Examples) +
+		len(comps.SecuritySchemes) + len(comps.Links) + len(comps.Callbacks)
 }
 
 // traceAllRefs explores the document to identify all reachable components.
@@ -441,11 +515,14 @@ func (c *cleaner) traceAllRefs(used map[string]bool) {
 		}
 	}
 
+	if c.doc.Paths == nil {
+		return
+	}
+
 	for _, pathItem := range c.doc.Paths.Map() {
 		if pathItem == nil {
 			continue
 		}
-		// PathItem level parameters and ref
 		if pathItem.Ref != "" {
 			used[pathItem.Ref] = true
 		}
@@ -464,7 +541,6 @@ func (c *cleaner) traceOperationRefs(op *openapi3.Operation, used map[string]boo
 	if op == nil {
 		return
 	}
-	// Operation level security
 	if op.Security != nil {
 		for _, sec := range *op.Security {
 			for name := range sec {
@@ -486,29 +562,11 @@ func (c *cleaner) traceOperationRefs(op *openapi3.Operation, used map[string]boo
 		c.traceRefs(def.Ref, def.Value, used)
 	}
 
-	// Callbacks
 	for _, callback := range op.Callbacks {
-		if callback.Value != nil {
-			for _, cbPathItem := range callback.Value.Map() {
-				if cbPathItem != nil {
-					for _, cbOp := range cbPathItem.Operations() {
-						c.traceOperationRefs(cbOp, used)
-					}
-				}
-			}
+		if callback != nil {
+			c.traceRefs(callback.Ref, callback.Value, used)
 		}
 	}
-}
-
-// getComponentCount returns the total number of top-level components.
-func (c *cleaner) getComponentCount() int {
-	comps := c.doc.Components
-	if comps == nil {
-		return 0
-	}
-	return len(comps.Schemas) + len(comps.RequestBodies) + len(comps.Responses) +
-		len(comps.Parameters) + len(comps.Headers) + len(comps.Examples) +
-		len(comps.SecuritySchemes) + len(comps.Links) + len(comps.Callbacks)
 }
 
 // traceMediaTypeRefs traces all references in a media type object.
@@ -524,7 +582,19 @@ func (c *cleaner) traceMediaTypeRefs(mt *openapi3.MediaType, used map[string]boo
 	}
 }
 
-// traceRefs recursively follows references and marks reachable components in the 'used' map.
+// isNil is a robust nil check for interfaces including typed nil pointers.
+func isNil(i interface{}) bool {
+	if i == nil {
+		return true
+	}
+	v := reflect.ValueOf(i)
+	if v.Kind() == reflect.Ptr {
+		return v.IsNil()
+	}
+	return false
+}
+
+// traceRefs recursively follows references and marks reachable components.
 func (c *cleaner) traceRefs(ref string, val interface{}, used map[string]bool) {
 	if ref != "" {
 		if used[ref] {
@@ -533,13 +603,10 @@ func (c *cleaner) traceRefs(ref string, val interface{}, used map[string]bool) {
 		used[ref] = true
 	}
 
-	// Nil check for both raw nil and typed nil interfaces (e.g., *SchemaRef(nil)).
-	isNil := val == nil || (reflect.ValueOf(val).Kind() == reflect.Ptr && reflect.ValueOf(val).IsNil())
-
-	if isNil {
+	if isNil(val) {
 		if ref != "" {
 			val = c.lookupRef(ref)
-			if val == nil {
+			if isNil(val) {
 				return
 			}
 		} else {
@@ -547,7 +614,7 @@ func (c *cleaner) traceRefs(ref string, val interface{}, used map[string]bool) {
 		}
 	}
 
-	// If we are traversing an object directly (no $ref yet), we track it to prevent infinite loops.
+	// Prevent infinite loops in recursive structures.
 	if ref == "" {
 		if c.visitedObjects[val] {
 			return
@@ -556,15 +623,34 @@ func (c *cleaner) traceRefs(ref string, val interface{}, used map[string]bool) {
 	}
 
 	switch v := val.(type) {
+	case *openapi3.SchemaRef:
+		c.traceRefs(v.Ref, v.Value, used)
+	case *openapi3.ResponseRef:
+		c.traceRefs(v.Ref, v.Value, used)
+	case *openapi3.RequestBodyRef:
+		c.traceRefs(v.Ref, v.Value, used)
+	case *openapi3.ParameterRef:
+		c.traceRefs(v.Ref, v.Value, used)
+	case *openapi3.HeaderRef:
+		c.traceRefs(v.Ref, v.Value, used)
+	case *openapi3.ExampleRef:
+		c.traceRefs(v.Ref, v.Value, used)
+	case *openapi3.SecuritySchemeRef:
+		c.traceRefs(v.Ref, v.Value, used)
+	case *openapi3.LinkRef:
+		c.traceRefs(v.Ref, v.Value, used)
+	case *openapi3.CallbackRef:
+		c.traceRefs(v.Ref, v.Value, used)
+
 	case *openapi3.Response:
-		for _, header := range v.Headers {
-			c.traceRefs(header.Ref, header.Value, used)
+		for _, h := range v.Headers {
+			c.traceRefs(h.Ref, h.Value, used)
 		}
 		for _, mt := range v.Content {
 			c.traceMediaTypeRefs(mt, used)
 		}
-		for _, link := range v.Links {
-			c.traceRefs(link.Ref, link.Value, used)
+		for _, l := range v.Links {
+			c.traceRefs(l.Ref, l.Value, used)
 		}
 	case *openapi3.RequestBody:
 		for _, mt := range v.Content {
@@ -585,61 +671,55 @@ func (c *cleaner) traceRefs(ref string, val interface{}, used map[string]bool) {
 			c.traceRefs(ex.Ref, ex.Value, used)
 		}
 	case *openapi3.Schema:
-		// Traverse all possible sub-schema references.
-		for _, prop := range v.Properties {
-			c.traceRefs(prop.Ref, prop.Value, used)
-		}
-		if v.Items != nil {
-			c.traceRefs(v.Items.Ref, v.Items.Value, used)
-		}
-		for _, s := range v.AllOf {
-			c.traceRefs(s.Ref, s.Value, used)
-		}
-		for _, s := range v.AnyOf {
-			c.traceRefs(s.Ref, s.Value, used)
-		}
-		for _, s := range v.OneOf {
-			c.traceRefs(s.Ref, s.Value, used)
-		}
-		if v.Not != nil {
-			c.traceRefs(v.Not.Ref, v.Not.Value, used)
-		}
-		if v.Discriminator != nil {
-			for _, mRef := range v.Discriminator.Mapping {
-				// MappingRef has Ref and Value in kin-openapi.
-				// We still trace it just in case, although MappingRef usually points to schemas.
-				// Since we don't have easy access to MappingRef fields here without more imports
-				// and it's complex, we keep the existing logic that seemed to compile.
-				// Wait, the previous logic was c.traceRefs(mRef.Ref, mRef.Value, used).
-				// If mRef is openapi3.MappingRef, it has Ref and Value.
-				c.traceRefs(mRef.Ref, mRef.Value, used)
-			}
-		}
-		if v.AdditionalProperties.Schema != nil {
-			c.traceRefs(v.AdditionalProperties.Schema.Ref, v.AdditionalProperties.Schema.Value, used)
-		}
+		c.traceSchemaRefs(v, used)
 	case *openapi3.Link:
-		if v.OperationRef != "" {
-			// OperationRef is a string, but what does it point to?
-			// Usually an operation in the same doc or external.
-			// Kin-openapi doesn't seem to have a component category for operations.
-		}
+		// OperationRef is tracked if we implement operation component tracking.
 	case *openapi3.Callback:
 		for _, pathItem := range v.Map() {
 			if pathItem != nil {
-				// We don't trace PathItem.Ref here as it's complex,
-				// but we trace its operations.
 				for _, op := range pathItem.Operations() {
 					c.traceOperationRefs(op, used)
 				}
 			}
 		}
 	case *openapi3.Example:
-		// Example doesn't have nested refs to other components.
+		// Leaf node.
+	case *openapi3.SecurityScheme:
+		// Usually leaf nodes regarding component refs.
 	}
 }
 
-// lookupRef attempts to find the component value for a given reference string.
+// traceSchemaRefs traces all references within a schema.
+func (c *cleaner) traceSchemaRefs(s *openapi3.Schema, used map[string]bool) {
+	for _, prop := range s.Properties {
+		c.traceRefs(prop.Ref, prop.Value, used)
+	}
+	if s.Items != nil {
+		c.traceRefs(s.Items.Ref, s.Items.Value, used)
+	}
+	for _, sub := range s.AllOf {
+		c.traceRefs(sub.Ref, sub.Value, used)
+	}
+	for _, sub := range s.AnyOf {
+		c.traceRefs(sub.Ref, sub.Value, used)
+	}
+	for _, sub := range s.OneOf {
+		c.traceRefs(sub.Ref, sub.Value, used)
+	}
+	if s.Not != nil {
+		c.traceRefs(s.Not.Ref, s.Not.Value, used)
+	}
+	if s.Discriminator != nil {
+		for _, mRef := range s.Discriminator.Mapping {
+			c.traceRefs(mRef.Ref, mRef.Value, used)
+		}
+	}
+	if s.AdditionalProperties.Schema != nil {
+		c.traceRefs(s.AdditionalProperties.Schema.Ref, s.AdditionalProperties.Schema.Value, used)
+	}
+}
+
+// lookupRef attempts to find the component Ref object for a given reference string.
 func (c *cleaner) lookupRef(ref string) interface{} {
 	if c.doc.Components == nil {
 		return nil
@@ -661,47 +741,47 @@ func (c *cleaner) lookupRef(ref string) interface{} {
 	case strings.HasPrefix(ref, schemasPrefix):
 		name := strings.TrimPrefix(ref, schemasPrefix)
 		if r, ok := c.doc.Components.Schemas[name]; ok {
-			return r.Value
+			return r
 		}
 	case strings.HasPrefix(ref, responsesPrefix):
 		name := strings.TrimPrefix(ref, responsesPrefix)
 		if r, ok := c.doc.Components.Responses[name]; ok {
-			return r.Value
+			return r
 		}
 	case strings.HasPrefix(ref, parametersPrefix):
 		name := strings.TrimPrefix(ref, parametersPrefix)
 		if r, ok := c.doc.Components.Parameters[name]; ok {
-			return r.Value
+			return r
 		}
 	case strings.HasPrefix(ref, requestBodiesPrefix):
 		name := strings.TrimPrefix(ref, requestBodiesPrefix)
 		if r, ok := c.doc.Components.RequestBodies[name]; ok {
-			return r.Value
+			return r
 		}
 	case strings.HasPrefix(ref, headersPrefix):
 		name := strings.TrimPrefix(ref, headersPrefix)
 		if r, ok := c.doc.Components.Headers[name]; ok {
-			return r.Value
+			return r
 		}
 	case strings.HasPrefix(ref, examplesPrefix):
 		name := strings.TrimPrefix(ref, examplesPrefix)
 		if r, ok := c.doc.Components.Examples[name]; ok {
-			return r.Value
+			return r
 		}
 	case strings.HasPrefix(ref, securityPrefix):
 		name := strings.TrimPrefix(ref, securityPrefix)
 		if r, ok := c.doc.Components.SecuritySchemes[name]; ok {
-			return r.Value
+			return r
 		}
 	case strings.HasPrefix(ref, linksPrefix):
 		name := strings.TrimPrefix(ref, linksPrefix)
 		if r, ok := c.doc.Components.Links[name]; ok {
-			return r.Value
+			return r
 		}
 	case strings.HasPrefix(ref, callbacksPrefix):
 		name := strings.TrimPrefix(ref, callbacksPrefix)
 		if r, ok := c.doc.Components.Callbacks[name]; ok {
-			return r.Value
+			return r
 		}
 	}
 	return nil
