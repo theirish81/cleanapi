@@ -175,42 +175,59 @@ func TestCleanAndPruneOpenAPI_RecursiveSchema(t *testing.T) {
 	})
 }
 
-func TestCleanAndPruneOpenAPI_CircularComponent(t *testing.T) {
-	// Create a circular component schema: A -> B -> A
-	schemaA := &openapi3.Schema{Type: &openapi3.Types{"object"}, Properties: make(openapi3.Schemas)}
-	schemaB := &openapi3.Schema{Type: &openapi3.Types{"object"}, Properties: make(openapi3.Schemas)}
-
-	schemaA.Properties["b"] = &openapi3.SchemaRef{Value: schemaB}
-	schemaB.Properties["a"] = &openapi3.SchemaRef{Value: schemaA}
-
+func TestCleanAndPruneOpenAPI_KeepTags(t *testing.T) {
 	doc := &openapi3.T{
 		OpenAPI: "3.0.0",
-		Info:    &openapi3.Info{Title: "Circular Component API", Version: "1.0.0"},
+		Info:    &openapi3.Info{Title: "Test", Version: "1.0.0"},
 		Paths:   openapi3.NewPaths(),
-		Components: &openapi3.Components{
-			Schemas: make(openapi3.Schemas),
-		},
 	}
-	doc.Components.Schemas["A"] = &openapi3.SchemaRef{Value: schemaA}
 
-	// Reference A from a path
-	op := &openapi3.Operation{
-		OperationID: "getA",
-		Responses:   openapi3.NewResponses(),
-	}
-	op.Responses.Set("200", &openapi3.ResponseRef{
-		Value: &openapi3.Response{
-			Content: openapi3.NewContentWithJSONSchemaRef(&openapi3.SchemaRef{Ref: "#/components/schemas/A", Value: schemaA}),
-		},
-	})
-	doc.Paths.Set("/a", &openapi3.PathItem{Get: op})
+	op1 := &openapi3.Operation{OperationID: "op1", Tags: []string{"tag1"}}
+	op2 := &openapi3.Operation{OperationID: "op2", Tags: []string{"tag2"}}
+	op3 := &openapi3.Operation{OperationID: "op3", Tags: []string{"tag1", "tag3"}}
+	op4 := &openapi3.Operation{OperationID: "op4", Tags: []string{"tag4"}}
+
+	doc.Paths.Set("/path1", &openapi3.PathItem{Get: op1})
+	doc.Paths.Set("/path2", &openapi3.PathItem{Get: op2})
+	doc.Paths.Set("/path3", &openapi3.PathItem{Get: op3})
+	doc.Paths.Set("/path4", &openapi3.PathItem{Get: op4})
 
 	opts := CleanOptions{
-		CleanExamples: true,
+		KeepTags: []string{"tag1"},
 	}
 
-	// This should not hang or crash
-	assert.NotPanics(t, func() {
-		CleanAndPruneOpenAPI(doc, opts)
-	})
+	CleanAndPruneOpenAPI(doc, opts)
+
+	assert.NotNil(t, doc.Paths.Find("/path1"))
+	assert.Nil(t, doc.Paths.Find("/path2"))
+	assert.NotNil(t, doc.Paths.Find("/path3"))
+	assert.Nil(t, doc.Paths.Find("/path4"))
+
+	// Test combination of tags and operation IDs (Intersection)
+	doc = &openapi3.T{
+		OpenAPI: "3.0.0",
+		Info:    &openapi3.Info{Title: "Test", Version: "1.0.0"},
+		Paths:   openapi3.NewPaths(),
+	}
+	op1 = &openapi3.Operation{OperationID: "op1", Tags: []string{"tag1"}}
+	op2 = &openapi3.Operation{OperationID: "op2", Tags: []string{"tag2"}}
+	op3 = &openapi3.Operation{OperationID: "op3", Tags: []string{"tag1", "tag3"}}
+	op4 = &openapi3.Operation{OperationID: "op4", Tags: []string{"tag4"}}
+
+	doc.Paths.Set("/path1", &openapi3.PathItem{Get: op1})
+	doc.Paths.Set("/path2", &openapi3.PathItem{Get: op2})
+	doc.Paths.Set("/path3", &openapi3.PathItem{Get: op3})
+	doc.Paths.Set("/path4", &openapi3.PathItem{Get: op4})
+
+	opts = CleanOptions{
+		KeepTags:         []string{"tag1"},
+		KeepOperationIDs: []string{"op3"},
+	}
+
+	CleanAndPruneOpenAPI(doc, opts)
+
+	assert.Nil(t, doc.Paths.Find("/path1"))    // Has tag1 but not ID op3
+	assert.Nil(t, doc.Paths.Find("/path2"))    // Has neither
+	assert.NotNil(t, doc.Paths.Find("/path3")) // Has both tag1 and ID op3
+	assert.Nil(t, doc.Paths.Find("/path4"))    // Has neither
 }

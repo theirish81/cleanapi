@@ -44,6 +44,8 @@ cleanapi clean [flags]
 -   `-i, --input <file>`: (Required) The input OpenAPI specification (YAML or JSON).
 -   `-o, --output <file>`: Output path (default: `output.yaml`).
 -   `-O, --operation <id1,id2>`: List of Operation IDs to keep. All others will be removed.
+-   `-T, --tag <tag1,tag2>`: List of Tag names to keep. All operations with these tags will be kept.
+-   **Note**: If both `--operation` and `--tag` are provided, only operations that match **both** a tag and an ID will be kept (intersection).
 -   `--no-examples`: Remove all `example` and `examples` fields.
 -   `--only-2xx`: Remove all non-2xx responses (and the `default` response).
 -   `--no-response-schemas`: Remove the `content` field from all responses.
@@ -87,7 +89,8 @@ func main() {
 
 ### CleanOptions
 -   `CleanExamples`: Strips example data.
--   `KeepOperationIDs`: Filters the spec to a specific subset of operations.
+-   `KeepOperationIDs`: List of operation IDs to keep.
+-   `KeepTags`: List of tag names to keep.
 -   `RemoveNon2xxErrors`: Strips error responses.
 -   `RemoveResponseSchemas`: Strips response body definitions.
 -   `RemoveExtensions`: Strips all `x-` extensions.

@@ -5,6 +5,7 @@ package lib
 
 import (
 	"reflect"
+	"strings"
 
 	"github.com/getkin/kin-openapi/openapi3"
 )
@@ -16,6 +17,8 @@ type CleanOptions struct {
 	// KeepOperationIDs, if non-empty, specifies the only operation IDs to be kept in the spec.
 	// Operations not in this list will be removed, and empty paths will be pruned.
 	KeepOperationIDs []string
+	// KeepTags, if non-empty, specifies that all operations with these tags should be kept.
+	KeepTags []string
 	// RemoveNon2xxErrors, if true, removes all responses with a status code that does not start with '2'.
 	RemoveNon2xxErrors bool
 	// RemoveResponseSchemas, if true, removes the 'content' field from all responses,
@@ -33,7 +36,9 @@ type CleanOptions struct {
 type cleaner struct {
 	doc     *openapi3.T
 	opts    CleanOptions
-	keepOps map[string]bool
+	keepOps map[*openapi3.Operation]bool
+	// isFiltering is true if any operation filtering (by ID or Tag) is active.
+	isFiltering bool
 	// visitedSchemas tracks pointers to openapi3.Schema objects to prevent infinite recursion
 	// during the cleaning phase.
 	visitedSchemas map[*openapi3.Schema]bool
@@ -45,15 +50,55 @@ type cleaner struct {
 // CleanAndPruneOpenAPI is the main entry point for the cleaning process.
 // It modifies the provided openapi3.T document in-place based on the CleanOptions.
 func CleanAndPruneOpenAPI(doc *openapi3.T, opts CleanOptions) {
-	keepOps := make(map[string]bool, len(opts.KeepOperationIDs))
-	for _, id := range opts.KeepOperationIDs {
-		keepOps[id] = true
+	keepOps := make(map[*openapi3.Operation]bool)
+	isFiltering := len(opts.KeepOperationIDs) > 0 || len(opts.KeepTags) > 0
+
+	if isFiltering {
+		ids := make(map[string]bool)
+		for _, id := range opts.KeepOperationIDs {
+			ids[id] = true
+		}
+		tags := make(map[string]bool)
+		for _, t := range opts.KeepTags {
+			tags[t] = true
+		}
+
+		if doc.Paths != nil {
+			for _, pathItem := range doc.Paths.Map() {
+				for _, op := range pathItem.Operations() {
+					// We use intersection logic if both are provided: match tag AND match ID.
+					// If only one is provided, it just needs to match that one.
+
+					matchTag := len(tags) == 0
+					if !matchTag {
+						for _, t := range op.Tags {
+							if tags[t] {
+								matchTag = true
+								break
+							}
+						}
+					}
+
+					matchID := len(ids) == 0
+					if !matchID {
+						if op.OperationID != "" && ids[op.OperationID] {
+							matchID = true
+						}
+					}
+
+					if matchTag && matchID {
+						keepOps[op] = true
+					}
+				}
+			}
+		}
 	}
 
 	c := &cleaner{
 		doc:            doc,
 		opts:           opts,
 		keepOps:        keepOps,
+		isFiltering:    isFiltering,
 		visitedSchemas: make(map[*openapi3.Schema]bool),
 		visitedObjects: make(map[interface{}]bool),
 	}
@@ -105,11 +150,11 @@ func (c *cleaner) cleanPaths() {
 			pathItem.Extensions = nil
 		}
 
-		// Filter operations by operationId. This is done before cleaning individual operations
+		// Filter operations by operationId or tags. This is done before cleaning individual operations
 		// to avoid unnecessary work on operations that will be discarded.
-		if len(c.keepOps) > 0 {
+		if c.isFiltering {
 			for method, op := range pathItem.Operations() {
-				if op.OperationID == "" || !c.keepOps[op.OperationID] {
+				if !c.keepOps[op] {
 					pathItem.SetOperation(method, nil)
 				}
 			}
@@ -269,7 +314,7 @@ func (c *cleaner) cleanTags() {
 	}
 
 	usedTags := make(map[string]bool)
-	if len(c.keepOps) > 0 {
+	if c.isFiltering {
 		for _, pathItem := range c.doc.Paths.Map() {
 			for _, op := range pathItem.Operations() {
 				for _, tag := range op.Tags {
@@ -359,6 +404,26 @@ func (c *cleaner) pruneComponents() {
 				delete(c.doc.Components.Headers, name)
 			}
 		}
+		for name := range c.doc.Components.Examples {
+			if !usedRefs["#/components/examples/"+name] {
+				delete(c.doc.Components.Examples, name)
+			}
+		}
+		for name := range c.doc.Components.SecuritySchemes {
+			if !usedRefs["#/components/securitySchemes/"+name] {
+				delete(c.doc.Components.SecuritySchemes, name)
+			}
+		}
+		for name := range c.doc.Components.Links {
+			if !usedRefs["#/components/links/"+name] {
+				delete(c.doc.Components.Links, name)
+			}
+		}
+		for name := range c.doc.Components.Callbacks {
+			if !usedRefs["#/components/callbacks/"+name] {
+				delete(c.doc.Components.Callbacks, name)
+			}
+		}
 
 		// If no components were removed in this pass, we've reached a stable state.
 		if c.getComponentCount() == initialLen {
@@ -369,19 +434,67 @@ func (c *cleaner) pruneComponents() {
 
 // traceAllRefs explores the document to identify all reachable components.
 func (c *cleaner) traceAllRefs(used map[string]bool) {
+	// Global security requirements
+	for _, sec := range c.doc.Security {
+		for name := range sec {
+			used["#/components/securitySchemes/"+name] = true
+		}
+	}
+
 	for _, pathItem := range c.doc.Paths.Map() {
+		if pathItem == nil {
+			continue
+		}
+		// PathItem level parameters and ref
+		if pathItem.Ref != "" {
+			used[pathItem.Ref] = true
+		}
+		for _, p := range pathItem.Parameters {
+			c.traceRefs(p.Ref, p.Value, used)
+		}
+
 		for _, op := range pathItem.Operations() {
-			for _, p := range op.Parameters {
-				c.traceRefs(p.Ref, p.Value, used)
+			c.traceOperationRefs(op, used)
+		}
+	}
+}
+
+// traceOperationRefs traces all references in a single operation.
+func (c *cleaner) traceOperationRefs(op *openapi3.Operation, used map[string]bool) {
+	if op == nil {
+		return
+	}
+	// Operation level security
+	if op.Security != nil {
+		for _, sec := range *op.Security {
+			for name := range sec {
+				used["#/components/securitySchemes/"+name] = true
 			}
-			if op.RequestBody != nil {
-				c.traceRefs(op.RequestBody.Ref, op.RequestBody.Value, used)
-			}
-			for _, resp := range op.Responses.Map() {
-				c.traceRefs(resp.Ref, resp.Value, used)
-			}
-			if def := op.Responses.Default(); def != nil {
-				c.traceRefs(def.Ref, def.Value, used)
+		}
+	}
+
+	for _, p := range op.Parameters {
+		c.traceRefs(p.Ref, p.Value, used)
+	}
+	if op.RequestBody != nil {
+		c.traceRefs(op.RequestBody.Ref, op.RequestBody.Value, used)
+	}
+	for _, resp := range op.Responses.Map() {
+		c.traceRefs(resp.Ref, resp.Value, used)
+	}
+	if def := op.Responses.Default(); def != nil {
+		c.traceRefs(def.Ref, def.Value, used)
+	}
+
+	// Callbacks
+	for _, callback := range op.Callbacks {
+		if callback.Value != nil {
+			for _, cbPathItem := range callback.Value.Map() {
+				if cbPathItem != nil {
+					for _, cbOp := range cbPathItem.Operations() {
+						c.traceOperationRefs(cbOp, used)
+					}
+				}
 			}
 		}
 	}
@@ -394,12 +507,24 @@ func (c *cleaner) getComponentCount() int {
 		return 0
 	}
 	return len(comps.Schemas) + len(comps.RequestBodies) + len(comps.Responses) +
-		len(comps.Parameters) + len(comps.Headers) + len(comps.Examples)
+		len(comps.Parameters) + len(comps.Headers) + len(comps.Examples) +
+		len(comps.SecuritySchemes) + len(comps.Links) + len(comps.Callbacks)
+}
+
+// traceMediaTypeRefs traces all references in a media type object.
+func (c *cleaner) traceMediaTypeRefs(mt *openapi3.MediaType, used map[string]bool) {
+	if mt == nil {
+		return
+	}
+	if mt.Schema != nil {
+		c.traceRefs(mt.Schema.Ref, mt.Schema.Value, used)
+	}
+	for _, ex := range mt.Examples {
+		c.traceRefs(ex.Ref, ex.Value, used)
+	}
 }
 
 // traceRefs recursively follows references and marks reachable components in the 'used' map.
-// It uses reflection-based nil checks and visitedObjects to safely handle circular references
-// and typed nil pointers.
 func (c *cleaner) traceRefs(ref string, val interface{}, used map[string]bool) {
 	if ref != "" {
 		if used[ref] {
@@ -409,8 +534,17 @@ func (c *cleaner) traceRefs(ref string, val interface{}, used map[string]bool) {
 	}
 
 	// Nil check for both raw nil and typed nil interfaces (e.g., *SchemaRef(nil)).
-	if val == nil || (reflect.ValueOf(val).Kind() == reflect.Ptr && reflect.ValueOf(val).IsNil()) {
-		return
+	isNil := val == nil || (reflect.ValueOf(val).Kind() == reflect.Ptr && reflect.ValueOf(val).IsNil())
+
+	if isNil {
+		if ref != "" {
+			val = c.lookupRef(ref)
+			if val == nil {
+				return
+			}
+		} else {
+			return
+		}
 	}
 
 	// If we are traversing an object directly (no $ref yet), we track it to prevent infinite loops.
@@ -427,23 +561,28 @@ func (c *cleaner) traceRefs(ref string, val interface{}, used map[string]bool) {
 			c.traceRefs(header.Ref, header.Value, used)
 		}
 		for _, mt := range v.Content {
-			if mt.Schema != nil {
-				c.traceRefs(mt.Schema.Ref, mt.Schema.Value, used)
-			}
+			c.traceMediaTypeRefs(mt, used)
+		}
+		for _, link := range v.Links {
+			c.traceRefs(link.Ref, link.Value, used)
 		}
 	case *openapi3.RequestBody:
 		for _, mt := range v.Content {
-			if mt.Schema != nil {
-				c.traceRefs(mt.Schema.Ref, mt.Schema.Value, used)
-			}
+			c.traceMediaTypeRefs(mt, used)
 		}
 	case *openapi3.Parameter:
 		if v.Schema != nil {
 			c.traceRefs(v.Schema.Ref, v.Schema.Value, used)
 		}
+		for _, ex := range v.Examples {
+			c.traceRefs(ex.Ref, ex.Value, used)
+		}
 	case *openapi3.Header:
 		if v.Schema != nil {
 			c.traceRefs(v.Schema.Ref, v.Schema.Value, used)
+		}
+		for _, ex := range v.Examples {
+			c.traceRefs(ex.Ref, ex.Value, used)
 		}
 	case *openapi3.Schema:
 		// Traverse all possible sub-schema references.
@@ -467,11 +606,103 @@ func (c *cleaner) traceRefs(ref string, val interface{}, used map[string]bool) {
 		}
 		if v.Discriminator != nil {
 			for _, mRef := range v.Discriminator.Mapping {
+				// MappingRef has Ref and Value in kin-openapi.
+				// We still trace it just in case, although MappingRef usually points to schemas.
+				// Since we don't have easy access to MappingRef fields here without more imports
+				// and it's complex, we keep the existing logic that seemed to compile.
+				// Wait, the previous logic was c.traceRefs(mRef.Ref, mRef.Value, used).
+				// If mRef is openapi3.MappingRef, it has Ref and Value.
 				c.traceRefs(mRef.Ref, mRef.Value, used)
 			}
 		}
 		if v.AdditionalProperties.Schema != nil {
 			c.traceRefs(v.AdditionalProperties.Schema.Ref, v.AdditionalProperties.Schema.Value, used)
 		}
+	case *openapi3.Link:
+		if v.OperationRef != "" {
+			// OperationRef is a string, but what does it point to?
+			// Usually an operation in the same doc or external.
+			// Kin-openapi doesn't seem to have a component category for operations.
+		}
+	case *openapi3.Callback:
+		for _, pathItem := range v.Map() {
+			if pathItem != nil {
+				// We don't trace PathItem.Ref here as it's complex,
+				// but we trace its operations.
+				for _, op := range pathItem.Operations() {
+					c.traceOperationRefs(op, used)
+				}
+			}
+		}
+	case *openapi3.Example:
+		// Example doesn't have nested refs to other components.
 	}
+}
+
+// lookupRef attempts to find the component value for a given reference string.
+func (c *cleaner) lookupRef(ref string) interface{} {
+	if c.doc.Components == nil {
+		return nil
+	}
+
+	const (
+		schemasPrefix       = "#/components/schemas/"
+		responsesPrefix     = "#/components/responses/"
+		parametersPrefix    = "#/components/parameters/"
+		requestBodiesPrefix = "#/components/requestBodies/"
+		headersPrefix       = "#/components/headers/"
+		examplesPrefix      = "#/components/examples/"
+		securityPrefix      = "#/components/securitySchemes/"
+		linksPrefix         = "#/components/links/"
+		callbacksPrefix     = "#/components/callbacks/"
+	)
+
+	switch {
+	case strings.HasPrefix(ref, schemasPrefix):
+		name := strings.TrimPrefix(ref, schemasPrefix)
+		if r, ok := c.doc.Components.Schemas[name]; ok {
+			return r.Value
+		}
+	case strings.HasPrefix(ref, responsesPrefix):
+		name := strings.TrimPrefix(ref, responsesPrefix)
+		if r, ok := c.doc.Components.Responses[name]; ok {
+			return r.Value
+		}
+	case strings.HasPrefix(ref, parametersPrefix):
+		name := strings.TrimPrefix(ref, parametersPrefix)
+		if r, ok := c.doc.Components.Parameters[name]; ok {
+			return r.Value
+		}
+	case strings.HasPrefix(ref, requestBodiesPrefix):
+		name := strings.TrimPrefix(ref, requestBodiesPrefix)
+		if r, ok := c.doc.Components.RequestBodies[name]; ok {
+			return r.Value
+		}
+	case strings.HasPrefix(ref, headersPrefix):
+		name := strings.TrimPrefix(ref, headersPrefix)
+		if r, ok := c.doc.Components.Headers[name]; ok {
+			return r.Value
+		}
+	case strings.HasPrefix(ref, examplesPrefix):
+		name := strings.TrimPrefix(ref, examplesPrefix)
+		if r, ok := c.doc.Components.Examples[name]; ok {
+			return r.Value
+		}
+	case strings.HasPrefix(ref, securityPrefix):
+		name := strings.TrimPrefix(ref, securityPrefix)
+		if r, ok := c.doc.Components.SecuritySchemes[name]; ok {
+			return r.Value
+		}
+	case strings.HasPrefix(ref, linksPrefix):
+		name := strings.TrimPrefix(ref, linksPrefix)
+		if r, ok := c.doc.Components.Links[name]; ok {
+			return r.Value
+		}
+	case strings.HasPrefix(ref, callbacksPrefix):
+		name := strings.TrimPrefix(ref, callbacksPrefix)
+		if r, ok := c.doc.Components.Callbacks[name]; ok {
+			return r.Value
+		}
+	}
+	return nil
 }
