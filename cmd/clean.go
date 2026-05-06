@@ -26,18 +26,17 @@ var (
 
 // cleanCmd represents the 'clean' command which is the primary entry point for the CLI.
 var cleanCmd = &cobra.Command{
-	Use:   "clean",
+	Use:   "clean [input file]",
 	Short: "Clean an OpenAPI specification",
 	Long: `The clean command processes an OpenAPI specification to remove unwanted elements.
 It can follow external references, remove extensions, examples, and keep specific operations by ID or Tag.`,
+	Args: cobra.ExactArgs(1),
 	RunE: runClean,
 }
 
 // runClean orchestrates the loading, cleaning, and saving of the OpenAPI specification.
 func runClean(cmd *cobra.Command, args []string) error {
-	if inputFile == "" {
-		return fmt.Errorf("input file is required")
-	}
+	inputFile = args[0]
 
 	// 1. Load the specification (resolving external references if necessary).
 	doc, err := loadOpenAPI(inputFile)
@@ -100,7 +99,6 @@ func init() {
 	rootCmd.AddCommand(cleanCmd)
 
 	flags := cleanCmd.Flags()
-	flags.StringVarP(&inputFile, "input", "i", "", "Input OpenAPI spec file (YAML or JSON) (required)")
 	flags.StringVarP(&outputFile, "output", "o", "output.yaml", "Output file path")
 	flags.StringSliceVarP(&operationIds, "operation", "O", []string{}, "Operation IDs to keep (all others will be removed)")
 	flags.StringSliceVarP(&tags, "tag", "T", []string{}, "Tag names to keep (all operations with these tags will be kept)")
