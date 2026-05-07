@@ -12,10 +12,6 @@ func ptrString(s string) *string {
 	return &s
 }
 
-// --- Pruning (Garbage Collection) Tests ---
-// These tests run with default CleanOptions{} to verify that the reachability engine
-// correctly identifies and preserves referenced components while pruning unused ones.
-
 // TestCleanAndPruneOpenAPI_PruneUnusedComponents verifies that top-level components
 // (like schemas) that are not reachable from any path are removed.
 func TestCleanAndPruneOpenAPI_PruneUnusedComponents(t *testing.T) {
@@ -230,8 +226,6 @@ func TestCleanAndPruneOpenAPI_NestedRequestBody(t *testing.T) {
 	assert.Contains(t, doc.Components.RequestBodies, "B")
 }
 
-// --- Filtering Tests ---
-
 // TestCleanAndPruneOpenAPI_KeepOperationIDs verifies that only explicitly listed
 // operation IDs are kept and others are removed.
 func TestCleanAndPruneOpenAPI_KeepOperationIDs(t *testing.T) {
@@ -299,8 +293,6 @@ func TestCleanAndPruneOpenAPI_KeepTags(t *testing.T) {
 	assert.Nil(t, doc.Paths.Find("/path1"))    // tag matches but ID doesn't
 	assert.NotNil(t, doc.Paths.Find("/path3")) // both match
 }
-
-// --- Cleaning (Modification) Tests ---
 
 // TestCleanAndPruneOpenAPI_CleanExamples verifies that example data is stripped
 // from schemas, parameters, and headers when CleanExamples is true.
