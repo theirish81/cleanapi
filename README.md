@@ -37,22 +37,23 @@ go build -o cleanapi
 
 ### Usage
 ```bash
-cleanapi clean [flags]
+cleanapi clean <input-file> [flags]
 ```
 
 ### Flags
--   `-i, --input <file>`: (Required) The input OpenAPI specification (YAML or JSON).
 -   `-o, --output <file>`: Output path (default: `output.yaml`).
--   `-O, --operation <id1,id2>`: List of Operation IDs to keep. All others will be removed.
--   `--no-examples`: Remove all `example` and `examples` fields.
--   `--only-2xx`: Remove all non-2xx responses (and the `default` response).
--   `--no-response-schemas`: Remove the `content` field from all responses.
--   `--remove-extensions`: Remove all custom `x-` extensions.
--   `--strip-metadata`: Removes all the unnecessary info metadata
+-   `-O, --operation <id1,id2>`: List of Operation IDs to keep (all others will be removed).
+-   `-T, --tag <tag1,tag2>`: List of Tag names to keep (all operations with these tags will be kept).
+-   **Note**: If both `--operation` and `--tag` are provided, only operations that match **both** a tag and an ID will be kept (intersection).
+-   `--no-examples`: Remove all 'example' and 'examples' fields from schemas and components.
+-   `--only-2xx`: Remove all non-2xx responses and the default response.
+-   `--no-response-schemas`: Remove the 'content' field from all response objects.
+-   `--remove-extensions`: Remove all custom 'x-' extensions document-wide.
+-   `--strip-metadata`: Remove root-level and operation-level metadata (ExternalDocs, Contact, License, Deprecated).
 
 ### Example
 ```bash
-cleanapi clean -i internal-api.yaml -o public-api.yaml --only-2xx --no-examples --remove-extensions
+cleanapi clean internal-api.yaml -o public-api.yaml --only-2xx --no-examples --remove-extensions
 ```
 
 ## Library
@@ -87,7 +88,8 @@ func main() {
 
 ### CleanOptions
 -   `CleanExamples`: Strips example data.
--   `KeepOperationIDs`: Filters the spec to a specific subset of operations.
+-   `KeepOperationIDs`: List of operation IDs to keep.
+-   `KeepTags`: List of tag names to keep.
 -   `RemoveNon2xxErrors`: Strips error responses.
 -   `RemoveResponseSchemas`: Strips response body definitions.
 -   `RemoveExtensions`: Strips all `x-` extensions.

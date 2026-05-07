@@ -17,6 +17,7 @@ var (
 	outputFile        string
 	noExamples        bool
 	operationIds      []string
+	tags              []string
 	only2xx           bool
 	noResponseSchemas bool
 	removeExtensions  bool
@@ -25,18 +26,17 @@ var (
 
 // cleanCmd represents the 'clean' command which is the primary entry point for the CLI.
 var cleanCmd = &cobra.Command{
-	Use:   "clean",
+	Use:   "clean [input file]",
 	Short: "Clean an OpenAPI specification",
 	Long: `The clean command processes an OpenAPI specification to remove unwanted elements.
-It can follow external references, remove extensions, examples, and filter by operation IDs.`,
+It can follow external references, remove extensions, examples, and keep specific operations by ID or Tag.`,
+	Args: cobra.ExactArgs(1),
 	RunE: runClean,
 }
 
 // runClean orchestrates the loading, cleaning, and saving of the OpenAPI specification.
-func runClean(cmd *cobra.Command, args []string) error {
-	if inputFile == "" {
-		return fmt.Errorf("input file is required")
-	}
+func runClean(_ *cobra.Command, args []string) error {
+	inputFile = args[0]
 
 	// 1. Load the specification (resolving external references if necessary).
 	doc, err := loadOpenAPI(inputFile)
@@ -48,6 +48,7 @@ func runClean(cmd *cobra.Command, args []string) error {
 	lib.CleanAndPruneOpenAPI(doc, lib.CleanOptions{
 		CleanExamples:         noExamples,
 		KeepOperationIDs:      operationIds,
+		KeepTags:              tags,
 		RemoveNon2xxErrors:    only2xx,
 		RemoveResponseSchemas: noResponseSchemas,
 		RemoveExtensions:      removeExtensions,
@@ -98,12 +99,12 @@ func init() {
 	rootCmd.AddCommand(cleanCmd)
 
 	flags := cleanCmd.Flags()
-	flags.StringVarP(&inputFile, "input", "i", "", "Input OpenAPI spec file (required)")
 	flags.StringVarP(&outputFile, "output", "o", "output.yaml", "Output file path")
-	flags.StringSliceVarP(&operationIds, "operation", "O", []string{}, "Operation IDs to clean")
-	flags.BoolVar(&noExamples, "no-examples", false, "Remove all example and examples fields")
-	flags.BoolVar(&only2xx, "only-2xx", false, "Remove all non-2xx responses")
-	flags.BoolVar(&noResponseSchemas, "no-response-schemas", false, "Remove all response schemas")
-	flags.BoolVar(&removeExtensions, "remove-extensions", false, "Remove all x- extensions")
-	flags.BoolVar(&stripMetadata, "strip-metadata", false, "Removes all root level metadata")
+	flags.StringSliceVarP(&operationIds, "operation", "O", []string{}, "Operation IDs to keep (all others will be removed)")
+	flags.StringSliceVarP(&tags, "tag", "T", []string{}, "Tag names to keep (all operations with these tags will be kept)")
+	flags.BoolVar(&noExamples, "no-examples", false, "Remove all 'example' and 'examples' fields from schemas and components")
+	flags.BoolVar(&only2xx, "only-2xx", false, "Remove all non-2xx responses and the default response")
+	flags.BoolVar(&noResponseSchemas, "no-response-schemas", false, "Remove the 'content' field from all response objects")
+	flags.BoolVar(&removeExtensions, "remove-extensions", false, "Remove all custom 'x-' extensions document-wide")
+	flags.BoolVar(&stripMetadata, "strip-metadata", false, "Remove root-level and operation-level metadata (ExternalDocs, Contact, License, Deprecated)")
 }
