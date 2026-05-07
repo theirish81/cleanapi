@@ -35,7 +35,7 @@ It can follow external references, remove extensions, examples, and keep specifi
 }
 
 // runClean orchestrates the loading, cleaning, and saving of the OpenAPI specification.
-func runClean(cmd *cobra.Command, args []string) error {
+func runClean(_ *cobra.Command, args []string) error {
 	inputFile = args[0]
 
 	// 1. Load the specification (resolving external references if necessary).
